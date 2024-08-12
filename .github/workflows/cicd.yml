@@ -1,0 +1,104 @@
+# Name of the pipeline
+name: calculator-pl
+
+# What event is going to activate the pipeline.
+on:
+  push:
+    branches:
+      - master
+      - develop
+      - release  
+  
+# Here we define the tasks that we need github does when the event is activated.
+jobs:
+  # Job para la fase de CI: Construcción y pruebas
+  build_and_test:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11.5
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Linting
+        run: |
+          flake8 app/api.py
+
+      - name: Run tests
+        run: |
+          pytest
+
+  # Job para la fase de CD: Construcción de la imagen Docker
+  build_docker_image:
+    runs-on: self-hosted
+    needs: build_and_test
+    outputs:
+      version_git: ${{ steps.commit_hash_id.outputs.commit_hash }}
+    steps:
+      #- name: Checkout code
+      #  uses: actions/checkout@v3
+      - name: Get last commit hash and set as output
+        id: commit_hash_id
+        run: echo "::set-output name=commit_hash::$(git rev-parse HEAD)"
+
+      - name: Build docker image
+        run: docker build -t frontend-${{ vars.ENV }}:${{ steps.commit_hash_id.outputs.commit_hash }} --no-cache .
+
+  # Job para la fase de CD: Despliegue de la aplicación
+  deploy_app:
+    runs-on: self-hosted
+    needs: build_docker_image
+    environment:
+      name: ${{ 
+          github.event_name == 'push' && (
+            github.ref == 'refs/heads/master' && 'production' ||
+            github.ref == 'refs/heads/develop' && 'develop' ||
+            startsWith(github.ref, 'refs/heads/release/') && 'release'
+          ) ||
+          github.event_name == 'pull_request' && (
+            github.base_ref == 'master' && 'production' ||
+            github.base_ref == 'develop' && 'develop' ||
+            startsWith(github.base_ref, 'release/') && 'release'
+          )
+        }}
+    
+    steps:
+      - name: Remove previous existing container
+        run: |
+          docker ps -a --filter "name=frontend-${{ vars.ENV }}" -q | xargs -r docker rm -f
+
+      - name: Deploy app
+        run: |
+          docker run -d -p ${{vars.PORT}}:5055 --name frontend-${{ vars.ENV }} frontend-${{ vars.ENV }}:${{ needs.build_docker_image.outputs.version_git }}
+
+  # Job para la fase de CD: Verificación de salud de la aplicación
+  health_check:
+    runs-on: self-hosted
+    needs: deploy_app
+    environment:
+      name: ${{ 
+          github.event_name == 'push' && (
+            github.ref == 'refs/heads/master' && 'production' ||
+            github.ref == 'refs/heads/develop' && 'develop' ||
+            startsWith(github.ref, 'refs/heads/release/') && 'release'
+          )
+        }}
+
+    steps:
+      - name: Health check
+        run: |
+          response=$(curl --silent --write-out "%{http_code}" http://localhost:${{vars.PORT}}/health)
+          if [ "$response" -ne 200 ]; then
+            echo "Health check failed with status code $response"
+            exit 1
+          fi
+
+        
